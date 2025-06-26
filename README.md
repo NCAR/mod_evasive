@@ -59,6 +59,18 @@ Five different module sources have been provided:
 NOTE: mod_evasiveNSAPI is a port submitted by Reine Persson <reiper@rsv.se>
 	and is not officially supported as part of the mod_evasive project.
 
+# mod_evasive_envvar
+
+This fork adds the option to block clients based upon the value
+of a specified environment variable instead of IP address.
+If used in conjunction with a GeoIP module such as mod_maxminddb,
+one can block entire networks based on their ASN. This is useful
+in Distributed Denial of Service attacks, intentional or just
+uncaring, when a swarm of different IP addresses from the same
+organization hit the site in parallel, while any single IP is
+well below configured request limits. Only implemented in mod_evasive24.
+IP address is still used for whitelisting, not the specified variable.
+
 # How it works
 
 A web hit request comes in. The following steps take place:
@@ -190,6 +202,7 @@ Optionally you can also add the following directives:
 	DOSWhitelistUri     whitelist.*regex
 	DOSTargetlistUri    targetlist.*regex
 	DOSHTTPStatus       429
+	DOSClientVar        MM_ASN
 ```
 
 You will also need to add this line if you are building with dynamic support:
@@ -338,6 +351,16 @@ Choose an alternative HTTP status code for the reply to blocked clients.
 
 By default mod_evasive returns 403 Forbidden to blocked clients. This
 directive allows any other HTTP code known to Apache to be used instead.
+
+## DOSClientVar
+
+Name of an environemnt variable whose value is to be used as the
+client identifier instead of the IP address. If the variable name
+or value is blank or "-", fallback to IP address. To help combat
+Distributed Denial of Service attacks from multiple IP addresses
+in parallel, this is best used in conjunction with a module that
+groups client IP addresses into a single organizational identifier,
+such as the ASN provided by mod_maxminddb.
 
 ## Whitelisting IP Addresses
 

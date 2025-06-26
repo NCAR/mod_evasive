@@ -1,0 +1,14 @@
+all:	mod_evasive_envvar.la
+
+install:	mod_evasive_envvar.la
+	sudo apxs -i mod_evasive_envvar.la
+
+mod_evasive_envvar.la:	mod_evasive_envvar.c
+	apxs -c mod_evasive_envvar.c
+
+mod_evasive_envvar.c:
+	ln -s mod_evasive24.c mod_evasive_envvar.c
+
+clean:
+	$(RM) *.o *.la *.lo *.slo
+	$(RM) -rf .libs

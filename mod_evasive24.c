@@ -43,7 +43,7 @@
 
 /* BEGIN DoS Evasive Maneuvers Definitions */
 
-AP_DECLARE_MODULE(evasive);
+AP_DECLARE_MODULE(evasive_envvar);
 
 #define MAILER  "/bin/mail %s"
 
@@ -143,6 +143,7 @@ typedef struct {
     char *log_dir;
     char *system_command;
     int http_reply;
+    char *client_var;
 } evasive_config;
 
 static int is_whitelisted(const apr_sockaddr_t *client, const evasive_config *cfg);
@@ -190,6 +191,7 @@ static void * create_dir_conf(apr_pool_t *p, __attribute__((unused)) char *conte
         .log_dir = NULL,
         .system_command = NULL,
         .http_reply = DEFAULT_HTTP_REPLY,
+        .client_var = NULL,
     };
     if (!cfg->hit_list)
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf, "Failed to allocate hashtable");
@@ -454,10 +456,14 @@ static void pcre_vector_destroy(struct pcre_vector *vec)
 
 static int access_checker(request_rec *r)
 {
-    evasive_config *cfg = (evasive_config *) ap_get_module_config(r->per_dir_config, &evasive_module);
+    evasive_config *cfg = (evasive_config *) ap_get_module_config(
+        r->per_dir_config,
+        &evasive_envvar_module
+        );
 
     int ret = OK;
     const char *log_reason = NULL;
+    const char *client_str = NULL;
 
     /* BEGIN DoS Evasive Maneuvers Code */
 
@@ -466,12 +472,38 @@ static int access_checker(request_rec *r)
         struct ntt_node *ip_node, *n;
         apr_time_t t = r->request_time / 1000 / 1000; /* convert us to s */
 
-        /* Check whitelist */
+        /* Check whitelist (IP address only) */
         if (is_whitelisted(r->useragent_addr, cfg))
             return OK;
 
+        /* if we have a configured ClientVar then use its value
+         * for the client match string instead of the IP address */
+        if (cfg->client_var && *(cfg->client_var)) {
+            client_str = apr_table_get(r->subprocess_env,cfg->client_var);
+            ap_log_rerror (APLOG_MARK, APLOG_DEBUG, 0, r,
+                "using ClientVar %s = %s",
+                cfg->client_var,client_str
+                );
+            if (!client_str || !*client_str || !strcmp(client_str,"-")) {
+                client_str = r->useragent_ip;
+                ap_log_rerror (APLOG_MARK, APLOG_DEBUG, 0, r,
+                    "ClientVar empty, using IP %s",
+                    client_str
+                    );
+            }
+        } else {
+            client_str = r->useragent_ip;
+            ap_log_rerror (APLOG_MARK, APLOG_DEBUG, 0, r,
+                "no ClientVar, using IP %s",
+                client_str
+                );
+        }
+
+        /* sanity check (should be impossible): client_str is still empty/unknown so don't block */
+        if (!client_str || !*client_str) return OK;
+
         /* First see if the IP itself is on "hold" */
-        ip_node = ntt_find(cfg->hit_list, r->useragent_ip);
+        ip_node = ntt_find(cfg->hit_list, client_str);
 
         if (ip_node != NULL && t-ip_node->timestamp<cfg->blocking_period) {
 
@@ -495,10 +527,10 @@ static int access_checker(request_rec *r)
                 if (!ip_node || t-ip_node->timestamp>=cfg->blocking_period)
                     log_reason = "URI blocklist";
                 ret = cfg->http_reply;
-                ntt_insert(cfg->hit_list, r->useragent_ip, t);
+                ntt_insert(cfg->hit_list, client_str, t);
             } else {
                 /* Has URI been hit too much? */
-                snprintf(hash_key, sizeof(hash_key), "%s_%s", r->useragent_ip, r->uri);
+                snprintf(hash_key, sizeof(hash_key), "%s_%s", client_str, r->uri);
 
                 n = ntt_find(cfg->hit_list, hash_key);
                 if (n != NULL) {
@@ -508,7 +540,7 @@ static int access_checker(request_rec *r)
                         if (!ip_node || t-ip_node->timestamp>=cfg->blocking_period)
                             log_reason = "URI DOS";
                         ret = cfg->http_reply;
-                        ntt_insert(cfg->hit_list, r->useragent_ip, t);
+                        ntt_insert(cfg->hit_list, client_str, t);
                     } else {
 
                         /* Reset our hit count list as necessary */
@@ -523,7 +555,7 @@ static int access_checker(request_rec *r)
                 }
 
                 /* Has site been hit too much? */
-                snprintf(hash_key, sizeof(hash_key), "%s_SITE", r->useragent_ip);
+                snprintf(hash_key, sizeof(hash_key), "%s_SITE", client_str);
                 n = ntt_find(cfg->hit_list, hash_key);
                 if (n != NULL) {
 
@@ -532,7 +564,7 @@ static int access_checker(request_rec *r)
                         if (!ip_node || t-ip_node->timestamp>=cfg->blocking_period)
                             log_reason = "site DOS";
                         ret = cfg->http_reply;
-                        ntt_insert(cfg->hit_list, r->useragent_ip, t);
+                        ntt_insert(cfg->hit_list, client_str, t);
                     } else {
 
                         /* Reset our hit count list as necessary */
@@ -554,27 +586,27 @@ static int access_checker(request_rec *r)
             struct stat s;
             FILE *file;
 
-            snprintf(filename, sizeof(filename), "%s/dos-%s", cfg->log_dir != NULL ? cfg->log_dir : DEFAULT_LOG_DIR, r->useragent_ip);
+            snprintf(filename, sizeof(filename), "%s/dos-%s", cfg->log_dir != NULL ? cfg->log_dir : DEFAULT_LOG_DIR, client_str);
             if (stat(filename, &s)) {
                 file = fopen(filename, "w");
                 if (file != NULL) {
                     fprintf(file, "%ld\n", (long int)getpid());
                     fclose(file);
 
-                    ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, "Blacklisting address %s: possible DoS attack.", r->useragent_ip);
+                    ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, "Blacklisting address %s: possible DoS attack.", client_str);
                     if (cfg->email_notify != NULL) {
                         snprintf(filename, sizeof(filename), MAILER, cfg->email_notify);
                         file = popen(filename, "w");
                         if (file != NULL) {
                             fprintf(file, "To: %s\n", cfg->email_notify);
-                            fprintf(file, "Subject: HTTP BLACKLIST %s\n\n", r->useragent_ip);
-                            fprintf(file, "mod_evasive HTTP Blacklisted %s\n", r->useragent_ip);
+                            fprintf(file, "Subject: HTTP BLACKLIST %s\n\n", client_str);
+                            fprintf(file, "mod_evasive HTTP Blacklisted %s\n", client_str);
                             pclose(file);
                         }
                     }
 
                     if (cfg->system_command != NULL) {
-                        snprintf(filename, sizeof(filename), cfg->system_command, r->useragent_ip);
+                        snprintf(filename, sizeof(filename), cfg->system_command, client_str);
                          int systemRet = system(filename);
                          if(systemRet == -1){
                                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Couldn't execute %s %s ", filename, strerror(errno));
@@ -692,6 +724,7 @@ static apr_status_t destroy_config(void *dconfig) {
         free(cfg->email_notify);
         free(cfg->log_dir);
         free(cfg->system_command);
+        free(cfg->client_var);
         /* cfg is pool allocated */
    }
    return APR_SUCCESS;
@@ -1233,6 +1266,18 @@ get_http_reply(__attribute__((unused)) cmd_parms *cmd, void *dconfig, const char
     return NULL;
 }
 
+static const char *
+get_client_var(__attribute__((unused)) cmd_parms *cmd, void *dconfig, const char *value) {
+    evasive_config *cfg = (evasive_config *) dconfig;
+    if (value != NULL && value[0] != 0) {
+        if (cfg->client_var != NULL)
+            free(cfg->client_var);
+        cfg->client_var = strdup(value);
+    }
+
+    return NULL;
+}
+
 /* END Configuration Functions */
 
 static const command_rec access_cmds[] =
@@ -1282,6 +1327,9 @@ static const command_rec access_cmds[] =
     AP_INIT_ITERATE("DOSHTTPStatus", get_http_reply, NULL, RSRC_CONF,
             "HTTP reply code"),
 
+    AP_INIT_ITERATE("DOSClientVar", get_client_var, NULL, RSRC_CONF,
+            "Block clients by named environment variable instead of IP address"),
+
     { NULL }
 };
 
@@ -1290,7 +1338,7 @@ static void register_hooks(apr_pool_t *p) {
     apr_pool_cleanup_register(p, NULL, apr_pool_cleanup_null, destroy_config);
 };
 
-module AP_MODULE_DECLARE_DATA evasive_module =
+module AP_MODULE_DECLARE_DATA evasive_envvar_module =
 {
     STANDARD20_MODULE_STUFF,
     create_dir_conf,
@@ -1298,6 +1346,5 @@ module AP_MODULE_DECLARE_DATA evasive_module =
     NULL,
     NULL,
     access_cmds,
-    register_hooks,
-    AP_MODULE_FLAG_NONE
+    register_hooks
 };
